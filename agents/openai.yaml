@@ -1,4 +1,95 @@
 interface:
-  display_name: "Codex Pet Generator"
+  display_name: "Betty Boop"
   short_description: "Build Codex pets with safe row workflows"
   default_prompt: "Use $codex-pet-generator to turn these character refs into a validated Codex desktop pet."
+import tkinter as tk
+from openai import OpenAI
+import threading
+import sys
+
+# 1. Initialize OpenAI Client (Make sure your API key is in your environment variables)
+client = OpenAI()
+
+# 2. Define your pet's personality
+PET_PERSONALITY = (
+    "You are a sassy, Dark Jester loving vintage 1930s cartoon desktop pet inspired by Betty Boop. "
+    "Keep your answers very short, playful, and use classic phrases like 'Boop-oop-a-doop!' "
+    "and 'Oh, dear!' when appropriate."
+)
+
+conversation_history = [{"role": "system", "content": PET_PERSONALITY}]
+
+# 3. Terminal Chat Logic (Runs in a separate thread so it doesn't freeze the visual pet)
+def terminal_chat():
+    print("\n🐾 Your desktop pet is awake! Type your message in the terminal below. (Type 'exit' to quit)\n")
+    while True:
+        try:
+            user_input = input("You: ")
+            if user_input.lower() == 'exit':
+                print("Goodbye! Boop-oop-a-doop!")
+                root.quit()
+                sys.exit()
+                
+            if not user_input.strip():
+                continue
+
+            conversation_history.append({"role": "user", "content": user_input})
+            
+            # Request response from ChatGPT
+            completion = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=conversation_history
+            )
+            
+            reply = completion.choices[0].message.content
+            print(f"Pet: {reply}\n")
+            conversation_history.append({"role": "assistant", "content": reply})
+            
+        except Exception as e:
+            print(f"\nError connecting to ChatGPT: {e}\n")
+
+# 4. Transparent Desktop GUI
+root = tk.Tk()
+root.title("Desktop Pet")
+
+# Remove window borders and background
+root.overrideredirect(True) 
+root.config(bg='systemTransparent' if sys.platform == 'darwin' else 'white')
+if sys.platform != 'darwin':
+    root.wm_attributes("-transparentcolor", "white") # Sets white pixels to transparent (Windows)
+
+# Keep the pet on top of all other windows
+root.attributes("-topmost", True)
+
+# Dragging functionality so you can move your pet around the screen
+def start_drag(event):
+    root._x = event.x
+    root._y = event.y
+
+def drag(event):
+    x = root.winfo_x() + (event.x - root._x)
+    y = root.winfo_y() + (event.y - root._y)
+    root.geometry(f"+{x}+{y}")
+
+# 5. Visual Placeholder (Replace 'pet.png' with your own image asset)
+try:
+    # Use a transparent PNG image for best results
+    pet_image = tk.PhotoImage(file="pet.png") 
+    label = tk.Label(root, image=pet_image, bg=root['bg'])
+except Exception:
+    # Fallback placeholder box if no image file is found
+    label = tk.Label(root, text="🐾\nPET", font=("Arial", 16), bg="pink", fg="black", width=6, height=3)
+
+label.pack()
+label.bind("<Button-1>", start_drag)
+label.bind("<B1-Motion>", drag)
+
+# Position the pet on the bottom right screen overlay initially
+root.geometry("+1000+600")
+
+# Start the command-line chatbot thread
+chat_thread = threading.Thread(target=terminal_chat, daemon=True)
+chat_thread.start()
+
+# Launch the visual pet app
+root.mainloop()
