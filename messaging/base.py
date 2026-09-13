@@ -1,0 +1,287 @@
+"""
+MessagingInterface — channel-agnostic ABC.
+
+Each channel adapter (slack/, whatsapp/, teams/) must implement this interface.
+Internal code should import only from this module, never from a specific channel.
+
+The contract here is exactly what ``processes/monitor.py`` calls directly.
+Everything else (react, get_replies, is_own_message, is_bot_message,
+is_human_message, has_audio_attachment, upload_file, is_connected, …) is an
+internal implementation detail of each adapter — not part of this contract.
+"""
+
+from __future__ import annotations
+
+import sys
+from abc import ABC, abstractmethod
+from typing import Any, Dict, List, Optional
+
+from clients.posthog_client import capture
+from clients.super_ninja_client import get_thread_id
+from messaging.monitoring import MessageStateBatch
+
+
+class MessagingInterface(ABC):
+    """Abstract base class for all messaging channel adapters."""
+
+    def capture_welcome_message(self, channel: str) -> None:
+        """Emit the ninja_welcome_message PostHog event; never raises."""
+        try:
+            capture(
+                "ninja_welcome_message",
+                {"channel": channel, "thread_id": get_thread_id()},
+            )
+        except Exception:
+            print("⚠️ Failed to capture welcome message event", file=sys.stderr)
+
+    # ------------------------------------------------------------------
+    # Connection / health
+    # ------------------------------------------------------------------
+
+    @property
+    @abstractmethod
+    def is_connected(self) -> bool:
+        """Return True if the channel is reachable (tokens present, etc.)."""
+
+    # ------------------------------------------------------------------
+    # Sending
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    def say(
+        self,
+        message: str,
+        channel: Optional[str] = None,
+        thread_ts: Optional[str] = None,
+        username: Optional[str] = None,
+        icon_emoji: Optional[str] = None,
+        icon_url: Optional[str] = None,
+        agent: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Send a text message.
+
+        Args:
+            message:    Message body (Markdown supported where the channel allows).
+            channel:    Override the default channel/conversation.
+            thread_ts:  Thread / reply-to identifier (channel-specific format).
+            username:   Display name override for this message.
+            icon_emoji: Emoji avatar override.
+            icon_url:   Image URL avatar override.
+            agent:      Named agent whose configured identity to use.
+
+        Returns:
+            Channel API response dict.
+        """
+
+    # ------------------------------------------------------------------
+    # Reading
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    def upload_file(
+        self,
+        file_path: str,
+        channel: Optional[str] = None,
+        title: Optional[str] = None,
+        comment: Optional[str] = None,
+        thread_ts: Optional[str] = None,
+        agent: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Upload a file and share it in the channel.
+
+        Args:
+            file_path: Local path to the file.
+            channel:   Override the default channel/conversation.
+            title:     Optional display title for the file.
+            comment:   Optional text to accompany the file.
+            thread_ts: Thread / reply-to identifier.
+            agent:     Named agent whose identity to post under.
+
+        Returns:
+            Channel API response dict.
+        """
+
+    @abstractmethod
+    def get_history(
+        self,
+        channel: Optional[str] = None,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """Retrieve recent messages from a channel.
+
+        Args:
+            channel: Override the default channel/conversation.
+            limit:   Maximum number of messages to return.
+
+        Returns:
+            List of message dicts (structure is channel-specific).
+        """
+
+    # ------------------------------------------------------------------
+    # Monitor integration
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    def collect_pending(
+        self,
+        msg: Dict[str, Any],
+        agent_mentions: List[str],
+        seen_messages: set,
+        agent_data: dict,
+        pending_messages: list,
+        message_states: MessageStateBatch | None = None,
+    ) -> None:
+        """Process a single raw message from get_history().
+
+        For each unseen, non-own message this method:
+          1. Reacts with a channel-native ack when warranted.
+          2. Appends the message to ``pending_messages`` if the agent should respond.
+          3. Scans for unseen thread replies and appends those too.
+          4. Appends triage decisions to ``message_states`` (if provided) for
+             upstream pending-message tracking (SN-3996).
+
+        Mutates ``seen_messages``, ``agent_data``, ``pending_messages``, and
+        ``message_states`` in place.
+
+        The ack emoji, thread reply schema, and message classification
+        (own / bot / human / audio) are all internal to each adapter.
+
+        Args:
+            msg:              A single message dict from ``get_history()``.
+            agent_mentions:   List of keyword strings that trigger a response
+                              (e.g. ["ninja", "@ninja"]).
+            seen_messages:    Set of already-processed message IDs. Updated in place.
+            agent_data:       Persistent state dict (seen_replies, welcomed, …).
+                              Updated in place.
+            pending_messages: List to append actionable messages to. Updated in place.
+            message_states:   Batch to record triage decisions on via
+                              ``seen()``. Updated in place. ``None`` when
+                              tracking is disabled.
+        """
+
+    @abstractmethod
+    def post_welcome_if_needed(
+        self, agent: dict, welcome_text: str, welcome_signature: str
+    ) -> bool:
+        """Post ``welcome_text`` if the channel has no prior human messages.
+
+        Idempotent — checks both a persisted flag in ``agent_data`` and a
+        signature string in channel history before posting. Should never raise;
+        errors are swallowed so they do not block monitor startup.
+
+        Args:
+            agent:        Agent config dict (name, emoji, role, mentions, …).
+            welcome_text: The fully-rendered welcome message to post.
+
+        Returns:
+            True if the message was actually posted this call, False otherwise.
+        """
+
+    def prime_seen_state(
+        self,
+        seen_messages: set,
+        agent_data: dict,
+        message_states: MessageStateBatch | None = None,
+    ) -> None:
+        """Initialize the seen-message state"""
+        return
+
+    def batch_already_answered(self, pending_messages: list) -> bool:
+        """True if a reply from this agent already exists for the batch.
+
+        The retry loop (processes/common.py) treats a run as answered only when
+        the sent-store grows *during that poll cycle*. That misses a legitimate
+        case: a prior cycle already posted the reply, and the current run
+        correctly declined to post a duplicate. Without a cross-cycle check the
+        monitor keeps counting that as a failure and eventually fires a false
+        "couldn't finish it, please resend" notice for a message it did answer.
+
+        Adapters that can cheaply inspect a thread for one of their own replies
+        override this so the monitor can recognize an already-answered batch and
+        stop retrying it. Default is a conservative no-op (False), preserving the
+        existing same-cycle behavior for channels that don't implement it.
+        """
+        return False
+
+    # ------------------------------------------------------------------
+    # Health service integration
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    def check_messaging_health(self) -> Dict[str, Any]:
+        """Validate the messaging channel credentials and connectivity.
+
+        Called by ``processes/health_service.py`` on each health check cycle.
+        Should never raise — all errors must be caught and returned as a status
+        dict so the health service can continue with the remaining checks.
+
+        Returns:
+            Dict with at minimum:
+                ``service``  — channel name string (e.g. "slack", "whatsapp")
+                ``status``   — one of: "ok", "rotated", "missing", "invalid", "error"
+            Optional keys:
+                ``message``  — human-readable error detail
+                ``team``     — workspace / account name on success (if available)
+        """
+
+    # ------------------------------------------------------------------
+    # Configuration helpers (optional — channels may override)
+    # ------------------------------------------------------------------
+
+    @property
+    def default_channel(self) -> Optional[str]:
+        """Return the configured default channel identifier, if any."""
+        return None
+
+    @property
+    def default_channel_name(self) -> Optional[str]:
+        """Return the human-readable default channel name, if any."""
+        return None
+
+    def reporting_ids(self) -> tuple[str | None, str | None]:
+        """Return ``(workspace_id, channel_id)`` for pending-message reports.
+
+        Strict platform IDs only — never display names. The cache service
+        matches ``pending_messages`` rows on IDs, so a name like ``#general``
+        matches nothing and every report silently no-ops. Adapters that cannot
+        supply both IDs return ``(None, None)``, which callers read as
+        "reporting unavailable" and skip.
+        """
+        return None, None
+
+    # Check this before posting anything you plan to edit or delete later.
+    supports_message_edit: bool = False
+
+    def update_message(
+        self,
+        ts: str,
+        text: str,
+        blocks: Optional[list] = None,
+        channel: Optional[str] = None,
+    ) -> bool:
+        """Rewrite a message this agent posted. False when unsupported.
+
+        Not abstract on purpose — only Slack implements it, and the others just
+        report failure rather than break.
+        """
+        return False
+
+    def delete_message(self, ts: str, channel: Optional[str] = None) -> bool:
+        """Delete a message this agent posted. False when unsupported."""
+        return False
+
+    @abstractmethod
+    def get_unique_channel(self) -> str:
+        """Return a stable, workspace-scoped identifier for Pipedream Connect.
+
+        Used as the ``x-ninja-integration-channel-id`` header value sent to the
+        ninja-integrations-gateway. Must be stable for the lifetime of the
+        workspace — changing it creates a new empty gateway identity and
+        loses all connected apps.
+
+        The value should be prefixed with the messaging adapter type, e.g.
+        ``<adapter>-<workspace_id>.<channel_id>``.
+
+        Raises:
+            ValueError: If the required identity fields are not configured.
+        """
